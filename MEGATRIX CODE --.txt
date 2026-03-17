@@ -1,0 +1,477 @@
+ESP32 CODE --
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "driver/i2s.h"
+
+// ===== WIFI =====
+#define WIFI_SSID "Roshan"
+#define WIFI_PASS "12345678"
+
+// ===== SERVER =====
+#define SERVER_URL "http://10.179.208.228:5000/audio"
+
+// ===== I2S PINS =====
+#define I2S_BCLK 26
+#define I2S_WS   27
+#define MIC_SD   33
+#define AMP_DIN  25
+
+#define I2S_PORT I2S_NUM_0
+#define SAMPLE_RATE 16000
+#define RECORD_SECONDS 2
+#define SAMPLES (SAMPLE_RATE * RECORD_SECONDS)
+
+HardwareSerial ArduinoSerial(2);
+bool speakingNow = false;
+
+int16_t micBuffer[SAMPLES];
+
+// ===== TIMING VARS =====
+unsigned long t_listen_start;
+unsigned long t_record_end;
+unsigned long t_http_end;
+unsigned long t_speak_end;
+
+// ===== MIC =====
+void startMic() {
+  i2s_config_t cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S,
+    .dma_buf_count = 8,
+    .dma_buf_len = 256
+  };
+
+  i2s_pin_config_t pins = {
+    .bck_io_num = I2S_BCLK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = -1,
+    .data_in_num = MIC_SD
+  };
+
+  i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
+  i2s_set_pin(I2S_PORT, &pins);
+}
+
+// ===== SPEAKER =====
+void startSpeaker() {
+  i2s_config_t cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    .dma_buf_count = 8,
+    .dma_buf_len = 256,
+    .tx_desc_auto_clear = true
+  };
+
+  i2s_pin_config_t pins = {
+    .bck_io_num = I2S_BCLK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = AMP_DIN,
+    .data_in_num = -1
+  };
+
+  i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
+  i2s_set_pin(I2S_PORT, &pins);
+}
+
+void stopI2S() {
+  i2s_driver_uninstall(I2S_PORT);
+}
+
+// ===== SETUP =====
+void setup() {
+  Serial.begin(115200);
+  ArduinoSerial.begin(9600, SERIAL_8N1, 16, 17);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\n✅ ESP32 Voice AI Ready");
+  startMic();
+}
+
+// ===== LOOP =====
+void loop() {
+  unsigned long t_cycle_start = millis();
+
+  int32_t sample;
+  size_t bytes;
+  int maxLevel = 0;
+
+  // ===== 🎤 LISTENING =====
+  t_listen_start = millis();
+  Serial.println("🎤 Listening...");
+
+  for (int i = 0; i < SAMPLES; i++) {
+    i2s_read(I2S_PORT, &sample, sizeof(sample), &bytes, portMAX_DELAY);
+    int16_t s = sample >> 14;
+    micBuffer[i] = s;
+    maxLevel = max(maxLevel, abs(s));
+  }
+
+  t_record_end = millis();
+  Serial.print("⏱ Recording time (ms): ");
+  Serial.println(t_record_end - t_listen_start);
+
+  if (maxLevel < 400) {
+    Serial.println("🤫 Silence detected");
+    delay(800);
+    return;
+  }
+
+  stopI2S();   // ❗ ONLY stop mic (STOP command REMOVED here)
+
+  // ===== 🌐 HTTP =====
+  Serial.println("🌐 Sending audio to server...");
+  unsigned long t_http_start = millis();
+
+  HTTPClient http;
+  http.begin(SERVER_URL);
+  http.addHeader("Content-Type", "application/octet-stream");
+
+  int code = http.POST((uint8_t*)micBuffer, sizeof(micBuffer));
+
+  t_http_end = millis();
+  Serial.print("⏱ Server response time (ms): ");
+  Serial.println(t_http_end - t_http_start);
+
+  if (code == 200) {
+    WiFiClient* stream = http.getStreamPtr();
+    startSpeaker();
+
+    // ===== 🔊 SPEAKING =====
+    Serial.println("🔊 Speaking...");
+    ArduinoSerial.println("STOP");     // ✅ STOP only while speaking
+    unsigned long t_speak_start = millis();
+
+    int16_t sample16;
+    size_t written;
+
+    while (stream->available() >= 2) {
+      stream->readBytes((uint8_t*)&sample16, 2);
+      sample16 = sample16 * 1.8;
+      i2s_write(I2S_PORT, &sample16, sizeof(sample16), &written, portMAX_DELAY);
+    }
+
+    i2s_zero_dma_buffer(I2S_PORT);
+    delay(30);
+
+    t_speak_end = millis();
+    Serial.print("⏱ Speaking time (ms): ");
+    Serial.println(t_speak_end - t_speak_start);
+
+    stopI2S();
+
+    delay(2000);                      // ⏱ 2 seconds wait
+    ArduinoSerial.println("RUN");     // ▶ RUN after speaking
+    Serial.println("▶ Robot resumed");
+  }
+
+  http.end();
+  startMic();
+
+  unsigned long t_cycle_end = millis();
+  Serial.print("⏱ TOTAL CYCLE TIME (ms): ");
+  Serial.println(t_cycle_end - t_cycle_start);
+  Serial.println("--------------------------------");
+
+  delay(1200);
+}
+
+ARDUINO CODE--
+
+#include <Servo.h>
+
+// ---------- ESP32 SERIAL ----------
+#define espSerial Serial   // 🔥 USE HARDWARE SERIAL
+
+// ---------- Motor Pins ----------
+#define ENA 5
+#define ENB 6
+#define IN1 8
+#define IN2 9
+#define IN3 10
+#define IN4 11
+
+// ---------- Ultrasonic ----------
+#define TRIG 12
+#define ECHO 13
+
+// ---------- Servo ----------
+#define SERVO_PIN 4
+
+Servo myServo;
+
+// ---------- CONTROL FLAG ----------
+bool robotEnabled = true;
+
+#define OBSTACLE_DIST 20
+
+// ---------- MOTOR FUNCTIONS ----------
+void moveForward() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, 150);
+  analogWrite(ENB, 150);
+}
+
+void stopRobot() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+void moveBackward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+void turnLeft() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+}
+
+void turnRight() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+}
+
+// ---------- DISTANCE ----------
+int getDistance() {
+  digitalWrite(TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+
+  long duration = pulseIn(ECHO, HIGH, 30000);
+  if (duration == 0) return 100;
+  return duration * 0.034 / 2;
+}
+
+// ---------- SETUP ----------
+void setup() {
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  pinMode(TRIG, OUTPUT);
+  pinMode(ECHO, INPUT);
+
+  myServo.attach(SERVO_PIN);
+  myServo.write(90);
+
+  Serial.begin(9600);   // 🔥 HARDWARE SERIAL
+
+  stopRobot();
+}
+
+// ---------- LOOP ----------
+void loop() {
+
+  if (espSerial.available()) {
+    String cmd = espSerial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd == "STOP") {
+      robotEnabled = false;
+      stopRobot();
+    }
+    else if (cmd == "RUN") {
+      robotEnabled = true;
+    }
+  }
+
+  if (!robotEnabled) {
+    stopRobot();
+    return;   // 🚫 FULL STOP
+  }
+
+  int distance = getDistance();
+
+  if (distance > OBSTACLE_DIST) {
+    moveForward();
+  } else {
+    stopRobot();
+    delay(300);
+
+    myServo.write(150);
+    delay(400);
+    int left = getDistance();
+
+    myServo.write(30);
+    delay(400);
+    int right = getDistance();
+
+    myServo.write(90);
+
+    if (left > right && left > OBSTACLE_DIST) {
+      turnLeft();
+      delay(400);
+    }
+    else if (right > OBSTACLE_DIST) {
+      turnRight();
+      delay(400);
+    }
+    else {
+      moveBackward();
+      delay(500);
+    }
+  }
+}
+FLASK AI--
+
+import os
+import io
+import wave
+import time
+import numpy as np
+from flask import Flask, request, Response
+from flask_cors import CORS
+from dotenv import load_dotenv
+import speech_recognition as sr
+from groq import Groq
+from gtts import gTTS
+from pydub import AudioSegment
+
+# ================= LOAD ENV =================
+load_dotenv(override=True)
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_KEY:
+    raise RuntimeError("GROQ_API_KEY not found")
+
+# ================= INIT =================
+app = Flask(__name__)
+CORS(app)
+
+recognizer = sr.Recognizer()
+groq_client = Groq(api_key=GROQ_KEY)
+
+WAKE_WORD = "hello mega"
+STATE = "SLEEP"          # 🔒 SLEEP | ACTIVE
+last_active = time.time()
+SLEEP_TIMEOUT = 30       # seconds
+
+print("✅ Flask Voice-AI Server Started (Wake Locked)")
+
+# ================= TTS =================
+def text_to_pcm_u8(text):
+    tts = gTTS(text=text, lang="en")
+    mp3_fp = io.BytesIO()
+    tts.write_to_fp(mp3_fp)
+    mp3_fp.seek(0)
+
+    audio = AudioSegment.from_file(mp3_fp, format="mp3")
+    audio = audio.set_channels(1).set_frame_rate(16000).set_sample_width(2)
+
+    raw_fp = io.BytesIO()
+    audio.export(raw_fp, format="raw")
+    raw_fp.seek(0)
+    return raw_fp.read()
+
+# ================= ROUTE =================
+@app.route("/audio", methods=["POST"])
+def audio():
+    global STATE, last_active
+
+    raw_pcm = request.data
+    if not raw_pcm:
+        return Response(b"", status=200)
+
+    # ---- PCM → WAV ----
+    pcm16 = np.frombuffer(raw_pcm, dtype=np.int16)
+    wav_fp = io.BytesIO()
+    with wave.open(wav_fp, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(pcm16.tobytes())
+    wav_fp.seek(0)
+
+    # ---- Speech to Text ----
+    try:
+        with sr.AudioFile(wav_fp) as source:
+            audio_data = recognizer.record(source)
+        user_text = recognizer.recognize_google(audio_data).lower().strip()
+        print("🗣 USER:", user_text)
+    except:
+        return Response(b"", status=200)
+
+    # ================= SLEEP MODE =================
+    if STATE == "SLEEP":
+        if WAKE_WORD in user_text:
+            STATE = "ACTIVE"
+            last_active = time.time()
+            print("🔔 Wake word detected → ACTIVE MODE")
+
+            return Response(
+                text_to_pcm_u8("Hello. I am Mega. Ask your question."),
+                mimetype="application/octet-stream"
+            )
+        else:
+            # 🔒 Ignore EVERYTHING before wake word
+            return Response(b"", status=200)
+
+    # ================= ACTIVE MODE =================
+    if STATE == "ACTIVE":
+
+        # Ignore wake word repetition
+        if user_text == WAKE_WORD:
+            return Response(b"", status=200)
+
+        # Timeout → go back to sleep
+        if time.time() - last_active > SLEEP_TIMEOUT:
+            STATE = "SLEEP"
+            print("😴 Timeout → BACK TO SLEEP")
+            return Response(b"", status=200)
+
+        last_active = time.time()
+
+        # ---- GROQ CALL ----
+        completion = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {"role": "system", "content": "You are Mega, a smart robot assistant. Reply briefly."},
+                {"role": "user", "content": user_text}
+            ],
+            temperature=0.6,
+            max_tokens=150
+        )
+
+        reply = completion.choices[0].message.content
+        print("🤖 AI:", reply)
+
+        return Response(
+            text_to_pcm_u8(reply),
+            mimetype="application/octet-stream"
+        )
+
+# ================= MAIN =================
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
+
+API-----
+
+
+GROQ_API_KEY="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"
